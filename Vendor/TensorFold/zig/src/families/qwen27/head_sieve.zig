@@ -69,7 +69,7 @@ pub const HeadSieve = struct {
             std.log.info("qwen27: head sieve off: head n {d} k {d} batch {d}", .{ head.n, head.k, head.batch });
             return null;
         }
-        const kappa: f32 = 7.0;
+        const kappa: f32 = 6.0;
         const tiles: u32 = head.n / 32;
         const groups: u32 = head.k / 64;
         // the head's shape and metadata form ahead of the kernels; kappa a literal (each value its own library)

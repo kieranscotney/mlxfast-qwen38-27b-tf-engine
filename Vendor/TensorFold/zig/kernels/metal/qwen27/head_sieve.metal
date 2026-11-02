@@ -18,7 +18,7 @@ using namespace mpp::tensor_ops;
 #define TF_TB 8
 #define TF_SBI 4096
 #define TF_SBI12 1
-#define TF_SIEVE_KAPPA 7.0f
+#define TF_SIEVE_KAPPA 6.0f
 #endif
 #ifndef TF_SIEVE_M
 #define TF_SIEVE_M 16
