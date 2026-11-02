@@ -359,7 +359,8 @@ const Run = struct {
     }
 
     fn wait(run: *Run) !void {
-        // Short sleeps instead of yield-spinning a core for the whole request (the CPU and GPU share one package's power);
+        // Short sleeps instead of yield-spinning a core for the whole request (the CPU and GPU share one package's
+        // power);
         // TF_BENCH_WAIT=yield: the yield loop; TF_BENCH_WAIT_US: the sleep between checks in microseconds (20)
         const sys = @import("sys").c;
         if (!std.mem.eql(u8, std.mem.span(sys.getenv("TF_BENCH_WAIT") orelse ""), "yield")) {
