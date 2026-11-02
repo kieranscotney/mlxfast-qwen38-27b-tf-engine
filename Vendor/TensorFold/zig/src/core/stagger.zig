@@ -2,7 +2,7 @@
 const std = @import("std");
 
 /// Segments one chunk can take.
-pub const MAX = 4;
+pub const MAX = 5;
 
 /// Where layer i waits for the segment before: ahead of pre (it reads what that one wrote, a conv tail) or of the mixer.
 pub const Wait = enum { pre, mixer };
