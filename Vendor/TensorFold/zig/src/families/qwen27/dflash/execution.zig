@@ -68,13 +68,24 @@ fn encodeAppend(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, tap
     return encodeAppendTo(ops, g, preparation, taps, positions, frame, .{ .transaction = transaction });
 }
 fn encodeAppendTo(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, taps: op.View, positions: []const u64, frame: u64, sink: Sink) !void {
+    // an early frame whose rows' keys and values a staging frame already computed gathers the admitted ones instead
+    if (sink == .transaction) if (ops.vtable.append_held) |held| if (try held(ops.ptr, sink.transaction, frame, positions)) return;
+    if (g.layers.len > max_layers) return error.DraftOperatorShape;
+    var keys: [max_layers]op.View = undefined;
+    var values: [max_layers]op.View = undefined;
+    try appendValues(ops, g, preparation, taps, positions, frame, &keys, &values);
+    for (g.layers, 0..) |_, i| switch (sink) {
+        .transaction => |t| try ops.vtable.context_append(ops.ptr, t, frame, @intCast(i), keys[i], values[i], positions),
+        .stream => |k| try ops.vtable.stream_append(ops.ptr, frame, k, @intCast(i), keys[i], values[i], positions),
+    };
+}
+/// The keys and values an append writes for `taps` rows at `positions`, layer by layer, without writing them.
+pub fn appendValues(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, taps: op.View, positions: []const u64, frame: u64, keys: *[max_layers]op.View, values: *[max_layers]op.View) !void {
     const c = g.config;
     const fusion = try project(ops, frame, taps, g.fusion, preparation.mode);
     const hidden = try norm(ops, frame, fusion, g.hidden_norm, c.eps, 1, c.hidden);
     // stage by stage across the layers (every product, then every norm, rope and append), so a frame's concurrent
     // encoder runs each stage's independent layers side by side; each value is computed exactly as layer by layer
-    var keys: [max_layers]op.View = undefined;
-    var values: [max_layers]op.View = undefined;
     if (g.layers.len > max_layers) return error.DraftOperatorShape;
     for (g.layers, 0..) |layer, i| {
         if (try group(ops, frame, hidden, layer.attention.k, 1, preparation.mode)) |kv| {
@@ -87,13 +98,9 @@ fn encodeAppendTo(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, t
     }
     for (g.layers, 0..) |layer, i| keys[i] = try norm(ops, frame, keys[i], layer.attention.k_norm, c.eps, c.kv_heads, c.head_dim);
     for (g.layers, 0..) |_, i| keys[i] = try rotate(ops, frame, keys[i], positions, c.kv_heads, c);
-    for (g.layers, 0..) |_, i| switch (sink) {
-        .transaction => |t| try ops.vtable.context_append(ops.ptr, t, frame, @intCast(i), keys[i], values[i], positions),
-        .stream => |k| try ops.vtable.stream_append(ops.ptr, frame, k, @intCast(i), keys[i], values[i], positions),
-    };
 }
 /// Layers a stage-by-stage append holds at once.
-const max_layers = 16;
+pub const max_layers = 16;
 
 /// append then forwardBlock in one frame: one commit and one wait for the committed taps and the block that reads them.
 pub fn appendBlock(ops: op.Ops, g: *const w.Graph, preparation: op.Preparation, context: op.Context, taps: op.View, positions: []const u64, next: op.Context, anchor: u32, block: u32) !op.Lattice {

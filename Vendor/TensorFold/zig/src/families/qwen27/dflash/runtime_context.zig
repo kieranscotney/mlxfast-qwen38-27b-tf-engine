@@ -29,6 +29,39 @@ pub fn append(ptr: *anyopaque, transaction: u64, epoch: u64, layer: u32, keys: o
     b.appended |= @as(u32, 1) << @intCast(layer);
     b.appended_rows = @intCast(positions.len);
 }
+/// An early frame's append from a staging frame's rows (Backend.held): the rows the verify admits, gathered from every
+/// verify row's keys and values by the round's result, then written as `append` writes them. False when none are held.
+pub fn appendHeld(ptr: *anyopaque, transaction: u64, epoch: u64, positions: []const u64) !bool {
+    const b = cast(ptr);
+    const h = b.held orelse return false;
+    b.held = null;
+    if (!b.admitting()) return false;
+    const e = try b.encoder(epoch);
+    if (b.transaction != transaction or transaction != epoch or b.appended != 0 or positions.len != 2) return error.BadDraftContext;
+    for (positions, 0..) |position, i| if (position != b.context.end + i) return error.BadCommittedTaps;
+    const width = b.config.kvWidth();
+    var keys: [16]op.View = undefined;
+    var values: [16]op.View = undefined;
+    const layers = b.config.layers;
+    if (layers > keys.len) return error.BadDraftContext;
+    const shape = @import("core").tree_commit_gpu.Taps{ .rows = h.rows, .width = width, .capacity = h.rows, .planes = 1 };
+    for (0..layers) |i| {
+        keys[i] = try b.frame.alloc(2, width, .bf16);
+        values[i] = try b.frame.alloc(2, width, .bf16);
+        b.access(e, &.{}, &.{ try b.span(keys[i]), try b.span(values[i]) });
+        const k = try b.frame.ref(keys[i]);
+        const v = try b.frame.ref(values[i]);
+        try h.commit.tapsInto(e, h.result, .{ .buf = h.keys[i].buf, .off = h.keys[i].off }, .{ .buf = k.buf, .off = k.off }, shape, 2);
+        try h.commit.tapsInto(e, h.result, .{ .buf = h.values[i].buf, .off = h.values[i].off }, .{ .buf = v.buf, .off = v.off }, shape, 2);
+    }
+    for (0..layers) |i| try appendRows(b, e, b.caches[i], keys[i], values[i], positions);
+    b.appended = (@as(u32, 1) << @intCast(layers)) - 1;
+    b.appended_rows = 2;
+    held_used += 1;
+    if (held_used % 128 == 0) std.log.warn("HELD used={d}", .{held_used});
+    return true;
+}
+pub var held_used: usize = 0;
 pub fn streamAppend(ptr: *anyopaque, epoch: u64, stream: u32, layer: u32, keys: op.View, values: op.View, positions: []const u64) !void {
     const b = cast(ptr);
     const e = try b.encoder(epoch);

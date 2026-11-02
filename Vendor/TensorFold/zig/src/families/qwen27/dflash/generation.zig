@@ -16,6 +16,7 @@ pub const Result = struct { tokens: []u32, rounds: usize, verified: usize, match
 pub const Extender = struct { ptr: *anyopaque, call: *const fn (*anyopaque, []const u32, u32) anyerror![]const u32 };
 /// The weight of a round in Generation.accept_share, and the share below which frames draft on q4 copies.
 const accept_step: f32 = 0.125;
+var acct: struct { rounds: usize = 0, landed: usize = 0, precise: usize = 0, rows: usize = 0, wall: f64 = 0, last: f64 = 0 } = .{};
 const precise_below: f32 = 0.95;
 /// The target's first layer's input projections, whole (quant_gpu.Kernels.warmAll): the first weights a verify streams.
 fn warmFirstLayer(ptr: *anyopaque, e: mtl.ComputeEncoder) anyerror!void {
@@ -255,6 +256,14 @@ pub const Generation = struct {
             // the next round's frame goes first, on the picks' fence (its words picked on the GPU from this round's
             // result); the keep follows once the verify ran, so it runs beside the frame (Frame.early)
             if (p.early) {
+                // every verify row's drafter keys and values, staged on their own queue beside the verify's last layers
+                const rows: u32 = if (p.shape) |shape| shape.rows else 0;
+                _ = g.draft.stageNext(g.runner.model.glue, &g.runner.taps, rows, &g.commit, result) catch |err| blk: {
+                    std.log.warn("STAGE error {s}", .{@errorName(err)});
+                    break :blk false;
+                };
+                defer g.draft.backend.frame.wait_before = null;
+                errdefer g.draft.backend.held = null;
                 const prepared = g.draft.prepareNext(.{ .ptr = p, .encode = lead }, 2) catch |err| {
                     keep_cb.commit();
                     g.keep = keep_cb.retain();
@@ -265,6 +274,7 @@ pub const Generation = struct {
                     p.held = true;
                     return;
                 }
+                g.draft.backend.held = null;
             }
             // committed without a wait: the drafter must not read or write what the keep writes until finishKeep
             keep_cb.commit();
@@ -315,6 +325,8 @@ pub const Generation = struct {
         // a frame the keep hook committed runs on: an error waits for it (and fails the drafter if it admitted nothing)
         errdefer g.draft.drainNext() catch {};
         errdefer picks.release();
+        if (early) g.draft.armStage() catch {};
+        defer @import("core").segments.after_layer = null;
         try g.runner.verifyHead(round, .all);
         picks.release();
         errdefer g.runner.failed = true;
@@ -425,6 +437,18 @@ pub const Generation = struct {
         if (accepted.path.len == 0 or accepted.tokens.len == 0 or accepted.tokens.len > @min(@import("core").tree_round.max_rows, remaining)) return error.EmptyAcceptedDraft;
         g.accept_share += (@as(f32, @floatFromInt(@intFromBool(accepted.matched > 0))) - g.accept_share) * accept_step;
         g.draft.backend.precise = g.accept_share < precise_below;
+        acct.rounds += 1;
+        acct.landed += @intFromBool(accepted.matched > 0);
+        acct.precise += @intFromBool(g.draft.backend.precise);
+        acct.rows += ids.len;
+        {
+            var t: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t);
+            const now = @as(f64, @floatFromInt(t.sec)) + @as(f64, @floatFromInt(t.nsec)) * 1e-9;
+            if (acct.last != 0 and now - acct.last < 0.2) acct.wall += now - acct.last;
+            acct.last = now;
+        }
+        if (acct.rounds % 128 == 0) std.log.warn("ACCT rounds={d} landed={d} precise={d} rows={d} round_ms={d:.3}", .{ acct.rounds, acct.landed, acct.precise, acct.rows, acct.wall * 1e3 / @as(f64, @floatFromInt(acct.rounds - 1)) });
         var landed: u32 = 0;
         for (accepted.path) |row| landed += @intFromBool(row >= drafted.len);
         const tokens = try g.allocator.dupe(u32, accepted.tokens);

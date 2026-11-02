@@ -80,6 +80,10 @@ pub fn runCommittingFrom(device: mtl.Device, queues: []const mtl.Queue, layers: 
 /// `runCommittingFrom`; `early` (one lane) also commits after the first layer's mixer and after each of the first three
 /// layers, so a long pass's GPU starts on the first mixer while the CPU encodes the rest of that layer and never waits
 /// for the first `every` layers' encode.
+/// A one-lane pass's event signalled between encoders right after one layer's MLP (a DFlash staging frame on another
+/// queue waits for its last tap layer); `signalled` reports that the pass encoded it.
+pub var after_layer: ?struct { ev: mtl.Event, value: u64, layer: usize } = null;
+pub var after_layer_signalled: bool = false;
 pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers: usize, mode: mtl.DispatchType, fam: anytype, first: usize, every: usize, early: bool) !f64 {
     try checkUnchecked();
     const n = queues.len;
@@ -166,6 +170,10 @@ pub fn runCommittingEarly(device: mtl.Device, queues: []const mtl.Queue, layers:
         }
         pub fn post(x: *const @This(), k: usize, i: usize) !void {
             try x.fam.post(&x.lanes[k], i);
+            if (after_layer) |s| if (x.lanes.len == 1 and i == s.layer) {
+                x.sync(&x.lanes[k], s.ev, s.value, false);
+                after_layer_signalled = true;
+            };
             if (x.every == 0 or i + 1 >= x.layers) return;
             // `first` 0 commits after the first layer's mixer and again after its MLP, so the GPU runs that MLP while the
             // host encodes the next chunk's layers

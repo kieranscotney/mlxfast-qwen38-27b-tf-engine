@@ -23,6 +23,7 @@ const Early = struct {
     /// Taps the verify admitted, once the host read it (commitNext).
     rows: ?u32 = null,
 };
+var dbg_n: usize = 0;
 pub const Model = struct {
     allocator: std.mem.Allocator,
     checkpoint: core.checkpoint_metal.Checkpoint,
@@ -149,6 +150,99 @@ pub const Model = struct {
         const prepared = try m.session.prepareTreeBlock(m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = &positions, .layers = c.taps, .target_end = context.end + 2 }, c.mask, block);
         m.early = .{ .block = prepared, .context = context };
         return true;
+    }
+    /// Arms the verify about to be encoded to signal the staging frame's event right after the drafter's last tap layer
+    /// (core.segments.after_layer); stageNext then commits that frame behind it.
+    pub fn armStage(m: *Model) !void {
+        const segments = core.segments;
+        segments.after_layer = null;
+        segments.after_layer_signalled = false;
+        if (!m.canPrepare(2)) return;
+        const b = &m.backend;
+        if (b.stage == null) {
+            const device = b.frame.device;
+            const queue = try device.queue();
+            errdefer queue.deinit();
+            const taps = try device.sharedEvent();
+            errdefer taps.deinit();
+            const done = try device.sharedEvent();
+            b.stage = .{ .queue = queue, .frame = .{ .allocator = b.allocator, .device = device, .queue = queue }, .taps = taps, .done = done };
+            b.stage.?.frame.setResident(b.frame.residency);
+        }
+        const s = &b.stage.?;
+        s.value += 1;
+        var last: u32 = 0;
+        for (m.graph.config.taps) |tap| last = @max(last, tap);
+        segments.after_layer = .{ .ev = .{ .id = s.taps.id }, .value = s.value, .layer = last };
+        dbg_n += 1;
+        if (dbg_n < 4) std.log.warn("STAGE arm value={d} layer={d}", .{ s.value, last });
+    }
+    /// On its own queue, behind the armed verify's last tap layer: every verify row's context keys and values for the
+    /// drafter (the append's arithmetic, row 0 at the context's end and the rest one past it) while the verify's last
+    /// layers run. The next early frame waits for it and gathers the rows the round's result admits (context.appendHeld).
+    pub fn stageNext(m: *Model, glue: @import("../glue_gpu.zig").Kernels, taps: *const @import("../taps.zig").Taps, rows: u32, commit: *const core.tree_commit_gpu.Ops, result: core.tree_commit_gpu.Ref) !bool {
+        const segments = core.segments;
+        const signalled = segments.after_layer_signalled and segments.after_layer != null;
+        segments.after_layer = null;
+        segments.after_layer_signalled = false;
+        const b = &m.backend;
+        b.held = null;
+        if (dbg_n < 4) std.log.warn("STAGE next signalled={} rows={d} can={}", .{ signalled, rows, m.canPrepare(2) });
+        if (!signalled or rows < 2 or rows > 16 or rows > taps.capacity or !m.canPrepare(2)) return false;
+        const s = &(b.stage orelse return false);
+        const c = m.graph.config;
+        if (c.layers > execution.max_layers or c.layers > 16) return false;
+        if (s.frame.active) {
+            // its command buffers are not retained past the round that committed it: its done event says it ran
+            if (s.frame.signal_after) |done| while (s.done.value() < done.value) std.atomic.spinLoopHint();
+            s.frame.completed = true;
+            s.frame.release();
+        }
+        s.frame.wait_before = .{ .ev = .{ .id = s.taps.id }, .value = s.value };
+        s.frame.signal_after = .{ .ev = .{ .id = s.done.id }, .value = s.value };
+        std.mem.swap(backend_mod.Frame, &b.frame, &s.frame);
+        var swapped = true;
+        defer if (swapped) std.mem.swap(backend_mod.Frame, &b.frame, &s.frame);
+        const ops = b.ops();
+        const epoch = try ops.vtable.begin(ops.ptr);
+        if (dbg_n < 4) std.log.warn("STAGE begun", .{});
+        errdefer b.frame.release();
+        const e = try b.encoder(epoch);
+        const x = try b.frame.alloc(rows, c.tapWidth(), .bf16);
+        const ids = try b.frame.alloc(rows, 4, .u8);
+        const xr = try b.frame.ref(x);
+        const ir = try b.frame.ref(ids);
+        for (ir.buf.slice(u32, rows), 0..) |*id, i| id.* = @intCast(i);
+        b.access(e, &.{}, &.{try b.span(x)});
+        try glue.tapRows(e, .{ .buffer = taps.buffer }, .{ .buffer = ir.buf, .offset = ir.off }, .{ .buffer = xr.buf, .offset = xr.off }, .{ .rows = rows, .width = taps.width, .capacity = taps.capacity, .planes = 5 });
+        var positions: [16]u64 = undefined;
+        for (positions[0..rows], 0..) |*p, i| p.* = m.session.context.end + @intFromBool(i > 0);
+        var keys: [execution.max_layers]op.View = undefined;
+        var values: [execution.max_layers]op.View = undefined;
+        try execution.appendValues(ops, &m.graph, m.preparation, x, positions[0..rows], epoch, &keys, &values);
+        var held = backend_mod.Held{ .rows = rows, .keys = undefined, .values = undefined, .commit = commit, .result = result };
+        for (0..c.layers) |i| {
+            held.keys[i] = try contiguous(b, epoch, keys[i]);
+            held.values[i] = try contiguous(b, epoch, values[i]);
+        }
+        try b.flushHeld(true);
+        try b.frame.commitLast(false);
+        std.mem.swap(backend_mod.Frame, &b.frame, &s.frame);
+        swapped = false;
+        b.held = held;
+        // the early frame encoded next waits for the staging frame's end before its first command
+        b.frame.wait_before = .{ .ev = .{ .id = s.done.id }, .value = s.value };
+        if (dbg_n < 4) std.log.warn("STAGE committed", .{});
+        return true;
+    }
+    /// A staging view's rows as a ref of contiguous kvWidth rows (copied when the view is a column slice).
+    fn contiguous(b: *Backend, epoch: u64, v: op.View) !backend_mod.Ref {
+        if (v.stride == v.width) return b.frame.ref(v);
+        const e = try b.encoder(epoch);
+        const y = try b.frame.alloc(v.rows, v.width, .bf16);
+        b.access(e, &.{try b.span(v)}, &.{try b.span(y)});
+        try b.copy(e, try b.frame.ref(v), try b.frame.ref(y), v.rows, v.width, v.stride);
+        return b.frame.ref(y);
     }
     /// The early frame's bridge spin, behind what the caller committed after the frame (Frame.early).
     pub fn bridgeNext(m: *Model) void {

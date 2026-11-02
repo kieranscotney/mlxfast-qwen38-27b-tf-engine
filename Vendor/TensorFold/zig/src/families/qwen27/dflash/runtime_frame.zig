@@ -127,6 +127,11 @@ pub const Frame = struct {
     poll_value: u64 = 0,
     unchecked: [9]mtl.CommandBuffer = undefined,
     n_unchecked: usize = 0,
+    /// Waited for before the frame's command buffers run (a staging frame: the verify's last tap layer; an early frame
+    /// that gathers staged rows: the staging frame's end).
+    wait_before: ?struct { ev: mtl.Event, value: u64 } = null,
+    /// Signalled behind the frame's last command (a staging frame, for the early frame that gathers its rows).
+    signal_after: ?struct { ev: mtl.Event, value: u64 } = null,
     pub fn setResident(f: *Frame, hook: ?mtl.ResidencySet.Follow) void {
         for (f.pool.items) |buffer| {
             if (f.residency) |h| h.leave(h.ctx, buffer);
@@ -198,6 +203,7 @@ pub const Frame = struct {
     }
     fn open(f: *Frame) mtl.CommandBuffer {
         const cb = f.queue.commandBuffer();
+        if (f.wait_before) |w| cb.waitForEvent(w.ev, w.value);
         return if (f.early) cb.retain() else cb;
     }
     /// Ends an early frame's hold on its command buffers.
@@ -247,6 +253,7 @@ pub const Frame = struct {
             f.poll_value += 1;
             f.cb.signal(ev, f.poll_value);
         }
+        if (f.signal_after) |s| f.cb.signalEvent(s.ev, s.value);
         f.cb.commit();
         f.committed = true;
         f.bridge_due = bridged;

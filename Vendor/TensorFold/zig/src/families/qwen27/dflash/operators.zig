@@ -85,6 +85,8 @@ pub const Ops = struct {
         project_group: ?*const fn (*anyopaque, u64, View, ck.Tensor, u32, Mode) anyerror!?View = null,
         // columns [first, first + width) of a view, an alias in the frame
         slice_cols: ?*const fn (*anyopaque, u64, View, u32, u32) anyerror!View = null,
+        /// An early frame's append from rows a staging frame computed: true when it wrote them (transaction, epoch, positions).
+        append_held: ?*const fn (*anyopaque, u64, u64, []const u64) anyerror!bool = null,
         // lattice in two calls: the head's top-k encoded and the frame committed without a wait (its picks), then, once
         // the GPU ran it, the wait and the readback; null: lattice only
         lattice_begin: ?*const fn (*anyopaque, u64, Head, Config) anyerror!View = null,

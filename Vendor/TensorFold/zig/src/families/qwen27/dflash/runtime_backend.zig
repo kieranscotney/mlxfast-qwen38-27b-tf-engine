@@ -173,6 +173,20 @@ pub const Lead = struct { ptr: *anyopaque, encode: *const fn (*anyopaque, mtl.Co
 
 pub const HeldNorm = struct { x: op.View, p: op.Norm, y: op.View };
 
+/// Every verify row's context keys and values for the drafter's layers, computed by a staging frame while the verify's
+/// last layers ran (Model.stageNext), contiguous rows of kvWidth; the next early frame gathers the admitted rows.
+pub const Held = struct {
+    rows: u32,
+    keys: [16]Ref,
+    values: [16]Ref,
+    commit: *const core.tree_commit_gpu.Ops,
+    result: core.tree_commit_gpu.Ref,
+};
+
+/// A frame on its own queue for the staging, and the events that order it after the verify's last tap layer and before
+/// the early frame that gathers its rows.
+pub const Stage = struct { queue: mtl.Queue, frame: Frame, taps: mtl.SharedEvent, done: mtl.SharedEvent, value: u64 = 0 };
+
 pub const Backend = struct {
     allocator: std.mem.Allocator,
     residency: ?mtl.ResidencySet.Follow = null,
@@ -216,6 +230,9 @@ pub const Backend = struct {
     /// While a frame is encoded early (its context and anchor are placeholders for the larger count): its first encoder
     /// runs this, and the launches that depend on the admitted count read their words from block 0 of `args`.
     early: ?Lead = null,
+    /// Rows a staging frame computed for the next early frame's append (context.appendHeld).
+    held: ?Held = null,
+    stage: ?Stage = null,
     pub fn init(a: std.mem.Allocator, target: *Target, checkpoint: *core.checkpoint_metal.Checkpoint, c: cfg.Config) !Backend {
         try c.check();
         const primitives = try core.draft_ops.Ops.init(target.device);
@@ -251,6 +268,12 @@ pub const Backend = struct {
     pub fn deinit(b: *Backend) void {
         b.setResident(null);
         b.frame.deinit();
+        if (b.stage) |*s| {
+            s.frame.deinit();
+            s.taps.deinit();
+            s.done.deinit();
+            s.queue.deinit();
+        }
         var prepared = b.prepared.valueIterator();
         while (prepared.next()) |adapter| adapter.deinit();
         b.prepared.deinit(b.allocator);
@@ -479,7 +502,7 @@ pub const Backend = struct {
         return b.frame.encoder;
     }
     /// Encodes the held conv (and with `norms` the held norms) on their own.
-    fn flushHeld(b: *Backend, norms: bool) !void {
+    pub fn flushHeld(b: *Backend, norms: bool) !void {
         if (b.held_conv) |h| {
             b.held_conv = null;
             try b.encodeConv(b.frame.encoder, h.x, h.p, h.y);
