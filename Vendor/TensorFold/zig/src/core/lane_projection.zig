@@ -631,6 +631,36 @@ pub const Projection = struct {
 
     /// Only the group sums of `x` into this projection's sums buffer (what encode dispatches first), with no barrier: the
     /// caller orders it before the encodeSums dispatches that read the returned sums.
+    /// A prompt-loop (prompt_sr) launch of any number of rows: one sums pass over every row into `sums` (the caller's
+    /// [group_count, 16 * blocks] f32 words), one barrier, one launch over every 16-row block. Each block's words are
+    /// the ones a reg_rows-row launch of it computes.
+    pub fn encodeTall(p: Projection, e: mtl.ComputeEncoder, x: Ref, w: Ref, sb: Ref, y: Ref, rows: u32, sums: Ref) !void {
+        if (!p.reg or p.rows8 or p.residual or p.count or p.tile_list) return error.InvalidSchedule;
+        const pipe = p.sums_pipe orelse return error.SumsNeedReg;
+        if (rows == 0) return error.InvalidRows;
+        const blocks = (rows + 15) / 16;
+        const stride: u32 = 16 * blocks;
+        try checkRef(x, rows * p.k * 2, 2);
+        try checkRef(w, p.weight_bytes, 16);
+        try checkRef(sb, p.metadata_bytes, 16);
+        try checkRef(y, ((rows - 1) * p.y_stride + p.n) * p.output_bytes, p.output_bytes);
+        try checkRef(sums, @as(usize, stride) * p.group_count * 4, 4);
+        e.setPipeline(pipe);
+        e.setBuffer(x.buf, x.off, 0);
+        e.setValue(@as(i32, @intCast(rows)), 1);
+        e.setBuffer(sums.buf, sums.off, 2);
+        e.setValue(@as(i32, @intCast(stride)), 3);
+        e.dispatchThreads(.{ .width = stride * p.group_count }, .{ .width = 256 });
+        e.barrier();
+        e.setPipeline(p.pipe);
+        e.setBuffer(x.buf, x.off, 0);
+        e.setBuffer(w.buf, w.off, 1);
+        e.setBuffer(sb.buf, sb.off, 2);
+        e.setValue([2]i32{ @intCast(rows), @intCast(stride) }, 3);
+        e.setBuffer(y.buf, y.off, 4);
+        e.setBuffer(sums.buf, sums.off, 5);
+        e.dispatchGroups(mtl.Size.of(p.tile_count, blocks, 1), mtl.Size.of(p.threads_per_slice * p.sk, 1, 1));
+    }
     pub fn encodeSumsOf(p: Projection, e: mtl.ComputeEncoder, x: Ref, rows: u32) !Sums {
         return p.encodeSumsOfAt(e, x, rows, null);
     }

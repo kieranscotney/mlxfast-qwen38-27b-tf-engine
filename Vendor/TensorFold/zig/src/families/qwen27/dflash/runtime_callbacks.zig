@@ -112,6 +112,15 @@ fn encodePrepared(b: *Backend, e: @import("metal").ComputeEncoder, x: op.View, y
             b.input_sums = .{ .view = x, .sums = sums };
         } else {
             if (p.sums_buffer) |sb| b.access(e, &.{xs}, &.{ ys, Span.whole(sb) }) else b.access(e, &.{xs}, &.{ys});
+            // a prompt absorb on a reg adapter's prompt loop: every row in one launch behind one sums pass
+            if (x.rows > @import("core").lane_projection.reg_rows and x.stride == x.width and y.stride == y.width) if (adapter.prompt) |tall| {
+                const stride = 16 * ((x.rows + 15) / 16);
+                const sums = try b.frame.alloc(stride, @intCast(tall.group_count), .f32);
+                const sr = try b.frame.ref(sums);
+                b.access(e, &.{xs}, &.{ ys, try b.span(sums) });
+                try tall.encodeTall(e, .{ .buf = input.buf, .off = input.off }, .{ .buf = adapter.words }, .{ .buf = adapter.metadata }, .{ .buf = output.buf, .off = output.off }, x.rows, .{ .buf = sr.buf, .off = sr.off });
+                return;
+            };
             // reg adapters take a prompt absorb's rows 128 at a time (16-row blocks on the grid, each block's words as alone)
             const step: u32 = if (p.reg) @import("core").lane_projection.reg_rows else 16;
             var first: u32 = 0;
