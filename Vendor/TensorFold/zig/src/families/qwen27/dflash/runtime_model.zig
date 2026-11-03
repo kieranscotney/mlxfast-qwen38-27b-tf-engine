@@ -24,8 +24,14 @@ const Early = struct {
     rows: ?u32 = null,
 };
 var dbg_n: usize = 0;
+/// The per-round append overlap (armStage/stageNext): measured neutral, off.
+const overlap_rounds = false;
+/// Prompt rows a staged catch-up leaves to the first frame (flushStaged): the first round drafts from these alone.
+const cold_rows = 128;
 pub const Model = struct {
     allocator: std.mem.Allocator,
+    /// Where a staged catch-up's first block attends from (flushStaged), until that block is drafted.
+    cold_begin: ?u64 = null,
     checkpoint: core.checkpoint_metal.Checkpoint,
     backend: Backend,
     graph: weights.Graph,
@@ -157,6 +163,7 @@ pub const Model = struct {
         const segments = core.segments;
         segments.after_layer = null;
         segments.after_layer_signalled = false;
+        if (!overlap_rounds) return;
         if (!m.canPrepare(2)) return;
         const b = &m.backend;
         if (b.stage == null) {
@@ -243,6 +250,70 @@ pub const Model = struct {
         b.access(e, &.{try b.span(v)}, &.{try b.span(y)});
         try b.copy(e, try b.frame.ref(v), try b.frame.ref(y), v.rows, v.width, v.stride);
         return b.frame.ref(y);
+    }
+    fn stageQueue(m: *Model) !*backend_mod.Stage {
+        const b = &m.backend;
+        if (b.stage == null) {
+            const device = b.frame.device;
+            const queue = try device.queue();
+            errdefer queue.deinit();
+            const taps = try device.sharedEvent();
+            errdefer taps.deinit();
+            const done = try device.sharedEvent();
+            b.stage = .{ .queue = queue, .frame = .{ .allocator = b.allocator, .device = device, .queue = queue }, .taps = taps, .done = done };
+            b.stage.?.frame.setResident(b.frame.residency);
+        }
+        const s = &b.stage.?;
+        if (s.frame.active) {
+            // its command buffers are not retained past the call that committed it: its done event says it ran
+            if (s.frame.signal_after) |done| while (s.done.value() < done.value) std.atomic.spinLoopHint();
+            s.frame.completed = true;
+            s.frame.release();
+        }
+        return s;
+    }
+    /// A prompt's catch-up split in two: every committed tap but the last cold_rows absorbed on the staging queue without a
+    /// wait (one pass, no ring wrap), then the last cold_rows here as flush does. True: the caller drafts its first block
+    /// from the cold rows alone (context begin at `cold_begin`) and the next frame waits for the staged rows' event.
+    pub fn flushStaged(m: *Model) !bool {
+        const b = &m.backend;
+        if (b.failed or b.frame.active or b.transaction != null or m.committed_end == 0 or m.session.context.end > m.committed_end) return false;
+        const c = m.graph.config;
+        const begin = m.committed_end -| (@as(u64, c.window) - 1);
+        const first = if (m.session.context.end < begin) begin else m.session.context.end;
+        if (m.committed_end - first <= 2 * cold_rows) return false;
+        const split = m.committed_end - cold_rows;
+        const slot: u32 = @intCast(first % c.window);
+        const rows: u32 = @intCast(split - first);
+        if (rows > flush_rows or slot + rows > c.window) return false;
+        const s = try m.stageQueue();
+        if (m.session.context.end < begin) {
+            m.session.context = .{ .cache = 1, .begin = begin, .end = begin };
+            m.session.ready = false;
+            b.context = m.session.context;
+        }
+        s.value += 1;
+        s.frame.wait_before = null;
+        s.frame.signal_after = .{ .ev = .{ .id = s.done.id }, .value = s.value };
+        var positions: [flush_rows]u64 = undefined;
+        for (positions[0..rows], 0..) |*position, i| position.* = first + i;
+        const stride = @as(usize, c.tapWidth()) * 2;
+        {
+            std.mem.swap(backend_mod.Frame, &b.frame, &s.frame);
+            b.in_stage = true;
+            defer {
+                b.in_stage = false;
+                std.mem.swap(backend_mod.Frame, &b.frame, &s.frame);
+            }
+            const view = try b.frame.borrow(.{ .buf = m.pending, .off = @as(usize, slot) * stride }, rows, c.tapWidth());
+            b.commit_no_wait = true;
+            defer b.commit_no_wait = false;
+            try m.session.absorb(b.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = c.taps, .target_end = split });
+        }
+        // the cold rows: the staged ones are not read by this frame's appends (each row's keys are its own)
+        try m.flush();
+        m.cold_begin = split;
+        return true;
     }
     /// The early frame's bridge spin, behind what the caller committed after the frame (Frame.early).
     pub fn bridgeNext(m: *Model) void {
@@ -411,8 +482,25 @@ pub const Model = struct {
             const view = try m.backend.frame.borrow(.{ .buf = m.pending, .off = @as(usize, slot) * stride }, rows, m.graph.config.tapWidth());
             return m.session.absorbTreeBlock(m.allocator, m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = m.graph.config.taps, .target_end = m.session.context.end + rows }, pending, block, .{ .nodes = nodes, .children = policy.children, .floor = policy.floor });
         }
-        try m.flush();
+        const staged = m.flushStaged() catch |err| blk: {
+            std.log.warn("staged catch-up refused: {s}", .{@errorName(err)});
+            break :blk false;
+        };
+        if (!staged) try m.flush();
         const first = try m.session.firstDraw();
+        // a staged catch-up's first block attends to the cold rows alone; the full context is back for the next frame
+        const full = m.session.context;
+        if (m.cold_begin) |cb| {
+            m.session.context.begin = cb;
+            m.backend.context.begin = cb;
+        }
+        defer if (m.cold_begin != null) {
+            m.cold_begin = null;
+            m.session.context = full;
+            m.backend.context = full;
+            // the next frame reads the staged rows: its command buffers wait for them
+            if (m.backend.stage) |*st| m.backend.wait_once = .{ .ev = .{ .id = st.done.id }, .value = st.value };
+        };
         return m.session.treeBlock(m.allocator, m.backend.ops(), &m.graph, m.preparation, pending, first, block, .{ .nodes = nodes, .children = policy.children, .floor = policy.floor });
     }
 };

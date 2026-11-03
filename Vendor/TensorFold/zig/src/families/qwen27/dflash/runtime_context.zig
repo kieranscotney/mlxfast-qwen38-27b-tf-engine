@@ -105,7 +105,13 @@ fn ready(b: *Backend, transaction: u64, epoch: u64, next: op.Context) !void {
 pub fn commit(ptr: *anyopaque, transaction: u64, epoch: u64, next: op.Context) !void {
     const b = cast(ptr);
     try ready(b, transaction, epoch, next);
-    b.frame.finish() catch |err| {
+    if (b.commit_no_wait) {
+        b.commit_no_wait = false;
+        b.frame.commitLast(false) catch |err| {
+            b.failed = true;
+            return err;
+        };
+    } else b.frame.finish() catch |err| {
         b.failed = true;
         return err;
     };

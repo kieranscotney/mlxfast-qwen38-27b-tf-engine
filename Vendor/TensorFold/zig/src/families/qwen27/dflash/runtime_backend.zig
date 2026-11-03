@@ -233,6 +233,12 @@ pub const Backend = struct {
     /// Rows a staging frame computed for the next early frame's append (context.appendHeld).
     held: ?Held = null,
     stage: ?Stage = null,
+    /// The next context commit only commits its frame (a staged catch-up on the staging queue); cleared once used.
+    commit_no_wait: bool = false,
+    /// The staging frame is swapped in as `frame` (Model.flushStaged).
+    in_stage: bool = false,
+    /// The next frame's command buffers wait for this event value first (a frame behind a staged catch-up).
+    wait_once: ?struct { ev: mtl.Event, value: u64 } = null,
     pub fn init(a: std.mem.Allocator, target: *Target, checkpoint: *core.checkpoint_metal.Checkpoint, c: cfg.Config) !Backend {
         try c.check();
         const primitives = try core.draft_ops.Ops.init(target.device);

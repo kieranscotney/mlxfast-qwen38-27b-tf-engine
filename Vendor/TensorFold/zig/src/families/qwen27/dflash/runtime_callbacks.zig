@@ -18,6 +18,11 @@ fn begin(ptr: *anyopaque) !u64 {
     b.held_conv = null;
     b.held_norms = @splat(null);
     b.hazards.clear();
+    if (b.wait_once) |w| b.frame.wait_before = .{ .ev = w.ev, .value = w.value };
+    defer if (b.wait_once != null) {
+        b.wait_once = null;
+        b.frame.wait_before = null;
+    };
     const lead = b.early orelse return b.frame.begin();
     // an early frame: its words are picked from the verify's result before anything reads them
     const epoch = try b.frame.beginEarly(true);
@@ -33,6 +38,8 @@ fn release(ptr: *anyopaque, epoch: u64) void {
     const b = backend(ptr);
     if (epoch != b.frame.epoch) return;
     // a frame abandoned before finish (an error path) now runs, and its context appends may overwrite ring rows
+    // a staged catch-up's frame runs on: its owner (Model.flushStaged) completes it by its done event
+    if (b.in_stage and b.frame.active and b.frame.committed and !b.frame.completed) return;
     if (b.frame.active and !b.frame.completed) b.failed = true;
     b.frame.release();
 }
