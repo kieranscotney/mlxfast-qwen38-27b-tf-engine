@@ -44,6 +44,12 @@ pub const Generation = struct {
     matcher: @import("round_gpu.zig").Matcher,
     commit: @import("core").tree_commit_gpu.Ops,
     keep: ?mtl.CommandBuffer = null, // the last round's cache and state commit, running behind the drafter
+    /// Signalled as each keep's last command (keep_value): settle waits on it, not on the command buffer's completion,
+    /// which the queue reports only behind the drafter frame committed before it.
+    keep_event: ?mtl.SharedEvent = null,
+    keep_value: u64 = 0,
+    /// A keep the GPU ran (its event reached) whose completion and failure are checked at the next settle.
+    keep_ran: ?mtl.CommandBuffer = null,
     picked: ?@import("core").segments.Fence = null, // updated behind a verify's picks; its keep waits on it
     pending: ?u32 = null, // runRound's next token as the last accept picked it; anything else that moves the target clears it
     journal: ?*AuditJournal = null,
@@ -76,6 +82,11 @@ pub const Generation = struct {
             cb.wait();
             cb.release();
         }
+        if (g.keep_ran) |cb| {
+            cb.wait();
+            cb.release();
+        }
+        if (g.keep_event) |ev| ev.deinit();
         g.commit.deinit();
         if (g.picked) |f| f.deinit();
         g.matcher.deinit();
@@ -183,6 +194,20 @@ pub const Generation = struct {
     fn finishKeep(g: *Generation) !void {
         const cb = g.keep orelse return;
         g.keep = null;
+        try g.checkKeepRan();
+        if (g.keep_event) |ev| {
+            // its last command signals keep_value: once the GPU ran it, the verify may follow; the command buffer's
+            // completion (reported behind the drafter frame's) and its failure are checked at the next settle
+            var spins: u32 = 0;
+            while (ev.value() < g.keep_value) : (spins +%= 1) {
+                if (spins % 4096 == 4095 and cb.status() == .@"error") break;
+                std.atomic.spinLoopHint();
+            }
+            if (ev.value() >= g.keep_value) {
+                g.keep_ran = cb;
+                return;
+            }
+        }
         defer cb.release();
         // its completion is reported behind the drafter frame's (committed before it), right before the next verify's
         // first commit (settle): poll its status rather than sleep until the completion wakes this thread
@@ -190,6 +215,17 @@ pub const Generation = struct {
             .completed, .@"error" => break,
             else => std.atomic.spinLoopHint(),
         };
+        cb.wait();
+        if (gpuFailed(cb, "a draft round's keep")) {
+            g.runner.failed = true;
+            return error.DraftKeepGpuFailure;
+        }
+    }
+    /// The failure check of a keep that settle let the verify follow once its event was reached.
+    fn checkKeepRan(g: *Generation) !void {
+        const cb = g.keep_ran orelse return;
+        g.keep_ran = null;
+        defer cb.release();
         cb.wait();
         if (gpuFailed(cb, "a draft round's keep")) {
             g.runner.failed = true;
@@ -252,6 +288,11 @@ pub const Generation = struct {
             try g.runner.keepDevice(p.round, k, g.commit, result);
             k.end();
             kept = true;
+            if (g.keep_event == null) g.keep_event = g.runner.model.device.sharedEvent() catch null;
+            if (g.keep_event) |ev| {
+                g.keep_value += 1;
+                keep_cb.signal(ev, g.keep_value);
+            }
             // the next round's frame goes first, on the picks' fence (its words picked on the GPU from this round's
             // result); the keep follows once the verify ran, so it runs beside the frame (Frame.early)
             if (p.early) {
